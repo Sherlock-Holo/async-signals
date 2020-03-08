@@ -1,6 +1,6 @@
-//!Library for easier and safe Unix signal handling, and async!
+//! Library for easier and safe Unix signal handling, and async!
 //!
-//! You can use this crate in with tokio, async-std or futures::executor runtime.
+//! You can use this crate with `tokio`, `async-std` or `futures::executor` runtime.
 
 use std::borrow::Borrow;
 use std::collections::HashMap;
@@ -45,11 +45,11 @@ fn reactor_loop() {
     }
 }
 
-/// Handle unix signal like `signal_hook::iterator::Signals`, but you can use `Stream` api to
-/// receive signal.
+/// Handle unix signal like `signal_hook::iterator::Signals`, receive signals
+/// with `futures::stream::Stream`.
 ///
 /// If you want to unregister all signal which register to a `Signals`, just drop it, it will
-/// unregister all signal.
+/// unregister all signals.
 pub struct Signals {
     token: Token,
     sys_signals: SysSignals,
@@ -58,10 +58,9 @@ pub struct Signals {
 }
 
 impl Signals {
-    /// Creates the `Signals` structure. all signals will be registered. `Signals` implement
-    /// `Stream`, you can use `Stream` api to get signal.
+    /// Creates the `Signals` structure, all signals will be registered.
     ///
-    /// Examples
+    /// # Examples
     ///
     /// ```
     /// use async_signal::Signals;
@@ -101,7 +100,7 @@ impl Signals {
 
     /// Registers another signal to a created `Signals`.
     ///
-    /// Examples
+    /// # Examples
     ///
     /// ```
     /// use async_signal::Signals;
