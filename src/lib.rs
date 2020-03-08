@@ -63,7 +63,7 @@ impl Signals {
     /// # Examples
     ///
     /// ```
-    /// use async_signal::Signals;
+    /// use async_signals::Signals;
     /// use futures_util::StreamExt;
     /// use nix::sys;
     /// use nix::unistd;
@@ -103,7 +103,7 @@ impl Signals {
     /// # Examples
     ///
     /// ```
-    /// use async_signal::Signals;
+    /// use async_signals::Signals;
     /// use futures_util::StreamExt;
     /// use nix::sys;
     /// use nix::unistd;
