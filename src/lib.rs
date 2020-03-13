@@ -9,12 +9,13 @@ use std::os::raw::c_int;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Once};
+use std::task::Context;
 use std::task::{Poll, Waker};
 use std::thread;
 
 use futures_util::stream::Stream;
-use futures_util::task::Context;
 use mio::{Events, Poll as MioPoll, PollOpt, Ready, Token};
+use signal_hook::cleanup::cleanup_signal;
 use signal_hook::iterator::Signals as SysSignals;
 
 use lazy_static::lazy_static;
@@ -50,11 +51,15 @@ fn reactor_loop() {
 ///
 /// If you want to unregister all signal which register to a `Signals`, just drop it, it will
 /// unregister all signals.
+///
+/// # Notes:
+/// for now you can't re-register some signals after drops a `Signals`, it may change in the future.
 pub struct Signals {
     token: Token,
     sys_signals: SysSignals,
     signals_buf: Vec<c_int>,
     is_registered: bool,
+    registered_signals: Mutex<Vec<c_int>>,
 }
 
 impl Signals {
@@ -88,11 +93,17 @@ impl Signals {
     {
         let token = TOKEN_GEN.fetch_add(1, Ordering::Relaxed);
 
+        let signals = signals
+            .into_iter()
+            .map(|signal| *signal.borrow())
+            .collect::<Vec<_>>();
+
         let signal = Self {
             token: Token(token as usize),
-            sys_signals: SysSignals::new(signals)?,
+            sys_signals: SysSignals::new(signals.clone())?,
             signals_buf: vec![],
             is_registered: false,
+            registered_signals: Mutex::new(signals),
         };
 
         Ok(signal)
@@ -125,7 +136,11 @@ impl Signals {
     /// ```
     #[inline]
     pub fn add_signal(&self, signal: c_int) -> Result<()> {
-        self.sys_signals.add_signal(signal)
+        self.sys_signals.add_signal(signal)?;
+
+        self.registered_signals.lock().unwrap().push(signal);
+
+        Ok(())
     }
 }
 
@@ -134,6 +149,14 @@ impl Drop for Signals {
         WAKERS.lock().unwrap().remove(&self.token);
 
         self.sys_signals.close();
+
+        self.registered_signals
+            .lock()
+            .unwrap()
+            .iter()
+            .for_each(|signal| {
+                let _ = cleanup_signal(*signal);
+            });
 
         // TODO should I ignore the error?
         let _ = POLL.deregister(&self.sys_signals);
