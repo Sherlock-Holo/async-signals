@@ -4,7 +4,7 @@ version = "0.3.0-alpha.0"
 authors = ["Sherlock Holo <sherlockya@gmail.com>"]
 edition = "2018"
 license = "MIT"
-description = "Library for easier and safe Unix signal handling, and async!"
+description = "Library for easier and safe Unix signal handling with async Stream."
 repository = "https://github.com/Sherlock-Holo/async-signal"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html

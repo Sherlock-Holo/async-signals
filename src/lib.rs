@@ -1,4 +1,4 @@
-//! Library for easier and safe Unix signal handling, and async!
+//! Library for easier and safe Unix signal handling with async Stream.
 //!
 //! You can use this crate with any async runtime.
 
