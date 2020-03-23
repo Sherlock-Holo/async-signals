@@ -1,6 +1,6 @@
 [package]
 name = "async-signals"
-version = "0.2.1-alpha.0"
+version = "0.3.0-alpha.0"
 authors = ["Sherlock Holo <sherlockya@gmail.com>"]
 edition = "2018"
 license = "MIT"
@@ -10,12 +10,10 @@ repository = "https://github.com/Sherlock-Holo/async-signal"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-signal-hook = { version = "0.1", features = ["mio-support"] }
-mio = "0.6"
 lazy_static = "1.4"
 futures-util = "0.3"
-libc = "0.2"
+nix = "0.17"
 
 [dev-dependencies]
 async-std = { version = "1.5", features = ["attributes"] }
-nix = "0.17"
+libc = "0.2"
