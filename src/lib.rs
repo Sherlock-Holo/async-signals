@@ -1,65 +1,112 @@
 //! Library for easier and safe Unix signal handling, and async!
 //!
-//! You can use this crate with `tokio`, `async-std` or `futures::executor` runtime.
+//! You can use this crate with any async runtime.
 
-use std::borrow::Borrow;
-use std::collections::HashMap;
-use std::io::Result;
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::convert::TryFrom;
 use std::os::raw::c_int;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, Once};
+use std::sync::{Arc, Mutex, RwLock};
 use std::task::Context;
 use std::task::{Poll, Waker};
-use std::thread;
 
 use futures_util::stream::Stream;
-use mio::{Events, Poll as MioPoll, PollOpt, Ready, Token};
-use signal_hook::cleanup::cleanup_signal;
-use signal_hook::iterator::Signals as SysSignals;
+use nix::sys::signal::{sigaction, SaFlags, SigAction, SigHandler, SigSet, Signal};
+use nix::Result;
 
 use lazy_static::lazy_static;
 
 lazy_static! {
-    static ref WAKERS: Arc<Mutex<HashMap<Token, Waker>>> = Arc::new(Mutex::new(HashMap::new()));
-    static ref TOKEN_GEN: AtomicU64 = AtomicU64::new(1);
-    static ref POLL: MioPoll = MioPoll::new().unwrap();
+    static ref ID_GEN: AtomicU64 = AtomicU64::new(0);
+    static ref SIGNAL_SET: RwLock<HashMap<u64, Arc<Mutex<InnerSignals>>>> =
+        RwLock::new(HashMap::new());
+    static ref SIGNAL_RECORD: Mutex<HashMap<c_int, usize>> = Mutex::new(HashMap::new());
 }
 
-const REACTOR_INIT_ONCE: Once = Once::new();
+extern "C" fn handle(receive_signal: c_int) {
+    let signal_map = SIGNAL_SET.read().unwrap();
 
-fn reactor_loop() {
-    let mut events = Events::with_capacity(1024);
+    for (_, signal) in signal_map.iter() {
+        let mut signal = signal.lock().unwrap();
 
-    loop {
-        POLL.poll(&mut events, None).expect("poll signal failed");
+        if signal.wants.contains(&receive_signal) {
+            signal.queue.push_back(receive_signal);
 
-        let mut wakers = WAKERS.lock().unwrap();
-
-        for event in &events {
-            let token = event.token();
-
-            if let Some(waker) = wakers.remove(&token) {
+            if let Some(waker) = signal.waker.take() {
                 waker.wake();
             }
         }
     }
 }
 
+#[derive(Debug)]
+struct InnerSignals {
+    queue: VecDeque<c_int>,
+    waker: Option<Waker>,
+    wants: HashSet<c_int>,
+}
+
+impl InnerSignals {
+    fn new(wants: HashSet<c_int>) -> Arc<Mutex<Self>> {
+        Arc::new(Mutex::new(Self {
+            queue: VecDeque::new(),
+            waker: None,
+            wants,
+        }))
+    }
+}
+
 /// Handle unix signal like `signal_hook::iterator::Signals`, receive signals
 /// with `futures::stream::Stream`.
 ///
-/// If you want to unregister all signal which register to a `Signals`, just drop it, it will
-/// unregister all signals.
+/// If multi `Signals` register a same signal, all of them will receive the signal.
+///
+/// If you drop all `Signals` which handle a signal like `SIGINT`, when process receive
+/// this signal, will use system default handler.
 ///
 /// # Notes:
-/// for now you can't re-register some signals after drops a `Signals`, it may change in the future.
+/// You can't handle `SIGKILL` or `SIGSTOP`.
+#[derive(Debug)]
 pub struct Signals {
-    token: Token,
-    sys_signals: SysSignals,
-    signals_buf: Vec<c_int>,
-    is_registered: bool,
-    registered_signals: Mutex<Vec<c_int>>,
+    id: u64,
+    inner: Arc<Mutex<InnerSignals>>,
+}
+
+impl Drop for Signals {
+    fn drop(&mut self) {
+        let mut signal_set = SIGNAL_SET.write().unwrap();
+
+        let mut signal_record = SIGNAL_RECORD.lock().unwrap();
+
+        signal_set.remove(&self.id);
+
+        let inner = self.inner.lock().unwrap();
+
+        for drop_signal in inner.wants.iter() {
+            let count = signal_record.get_mut(drop_signal).expect("must exist");
+
+            if *count > 1 {
+                *count -= 1;
+                continue;
+            }
+
+            signal_record.remove(drop_signal);
+
+            // no one wants to handle this signal, let default handler handle it.
+            let default_handler = SigHandler::SigDfl;
+            let default_action =
+                SigAction::new(default_handler, SaFlags::SA_RESTART, SigSet::empty());
+
+            unsafe {
+                // TODO should I ignore error?
+                let _ = sigaction(
+                    Signal::try_from(*drop_signal).expect("checked"),
+                    &default_action,
+                );
+            }
+        }
+    }
 }
 
 impl Signals {
@@ -81,32 +128,46 @@ impl Signals {
     ///     sys::signal::kill(pid, Some(sys::signal::SIGINT)).unwrap();
     ///
     ///     let signal = signals.next().await.unwrap();
-    ///     let signal = signal.unwrap();
     ///
     ///     assert_eq!(signal, libc::SIGINT);
     /// }
     /// ```
-    pub fn new<I, S>(signals: I) -> Result<Self>
-    where
-        I: IntoIterator<Item = S>,
-        S: Borrow<c_int>,
-    {
-        let token = TOKEN_GEN.fetch_add(1, Ordering::Relaxed);
+    pub fn new<I: IntoIterator<Item = c_int>>(signals: I) -> Result<Signals> {
+        let id = ID_GEN.fetch_add(1, Ordering::Relaxed);
 
-        let signals = signals
-            .into_iter()
-            .map(|signal| *signal.borrow())
-            .collect::<Vec<_>>();
+        let mut signal_set = SIGNAL_SET.write().unwrap();
 
-        let signal = Self {
-            token: Token(token as usize),
-            sys_signals: SysSignals::new(signals.clone())?,
-            signals_buf: vec![],
-            is_registered: false,
-            registered_signals: Mutex::new(signals),
-        };
+        let mut signal_record = SIGNAL_RECORD.lock().unwrap();
 
-        Ok(signal)
+        let handler = SigHandler::Handler(handle);
+
+        let action = SigAction::new(handler, SaFlags::SA_RESTART, SigSet::empty());
+
+        let mut wants = HashSet::new();
+
+        for signal in signals {
+            // register handle
+            unsafe {
+                sigaction(Signal::try_from(signal)?, &action)?;
+            }
+
+            wants.insert(signal);
+
+            // increase signal record count
+            signal_record
+                .entry(signal)
+                .and_modify(|count| *count += 1)
+                .or_insert(1);
+        }
+
+        let inner_signals = InnerSignals::new(wants);
+
+        signal_set.insert(id, inner_signals.clone());
+
+        Ok(Self {
+            id,
+            inner: inner_signals,
+        })
     }
 
     /// Registers another signal to a created `Signals`.
@@ -129,89 +190,48 @@ impl Signals {
     ///     sys::signal::kill(pid, Some(sys::signal::SIGINT)).unwrap();
     ///
     ///     let signal = signals.next().await.unwrap();
-    ///     let signal = signal.unwrap();
     ///
     ///     assert_eq!(signal, libc::SIGINT);
     /// }
     /// ```
     #[inline]
-    pub fn add_signal(&self, signal: c_int) -> Result<()> {
-        self.sys_signals.add_signal(signal)?;
+    pub fn add_signal(&mut self, signal: c_int) -> Result<()> {
+        let mut signal_record = SIGNAL_RECORD.lock().unwrap();
 
-        self.registered_signals.lock().unwrap().push(signal);
+        let handler = SigHandler::Handler(handle);
+
+        let action = SigAction::new(handler, SaFlags::SA_RESTART, SigSet::empty());
+
+        // register handle
+        unsafe {
+            sigaction(Signal::try_from(signal)?, &action)?;
+        }
+
+        let mut inner = self.inner.lock().unwrap();
+
+        inner.wants.insert(signal);
+
+        // increase signal record count
+        signal_record
+            .entry(signal)
+            .and_modify(|count| *count += 1)
+            .or_insert(1);
 
         Ok(())
     }
 }
 
-impl Drop for Signals {
-    fn drop(&mut self) {
-        WAKERS.lock().unwrap().remove(&self.token);
-
-        self.sys_signals.close();
-
-        self.registered_signals
-            .lock()
-            .unwrap()
-            .iter()
-            .for_each(|signal| {
-                let _ = cleanup_signal(*signal);
-            });
-
-        // TODO should I ignore the error?
-        let _ = POLL.deregister(&self.sys_signals);
-    }
-}
-
 impl Stream for Signals {
-    type Item = Result<c_int>;
+    type Item = c_int;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        let myself = self.get_mut();
+        let mut inner = self.inner.lock().unwrap();
 
-        if let Some(signal) = myself.signals_buf.pop() {
-            return Poll::Ready(Some(Ok(signal)));
+        if let Some(signal) = inner.queue.pop_front() {
+            return Poll::Ready(Some(signal));
         }
 
-        let pending = myself.sys_signals.pending().into_iter();
-
-        myself.signals_buf.extend(pending);
-
-        if let Some(signal) = myself.signals_buf.pop() {
-            return Poll::Ready(Some(Ok(signal)));
-        }
-
-        WAKERS
-            .lock()
-            .unwrap()
-            .insert(myself.token, cx.waker().clone());
-
-        let result = if myself.is_registered {
-            POLL.reregister(
-                &myself.sys_signals,
-                myself.token,
-                Ready::readable(),
-                PollOpt::edge() | PollOpt::oneshot(),
-            )
-        } else {
-            // lazy init reactor thread
-            REACTOR_INIT_ONCE.call_once(|| {
-                thread::spawn(reactor_loop);
-            });
-
-            myself.is_registered = true;
-
-            POLL.register(
-                &myself.sys_signals,
-                myself.token,
-                Ready::readable(),
-                PollOpt::edge() | PollOpt::oneshot(),
-            )
-        };
-
-        if let Err(err) = result {
-            return Poll::Ready(Some(Err(err)));
-        }
+        inner.waker.replace(cx.waker().clone());
 
         Poll::Pending
     }
@@ -233,7 +253,7 @@ mod tests {
 
         sys::signal::kill(pid, Some(sys::signal::SIGINT)).unwrap();
 
-        let interrupt = signal.next().await.unwrap().unwrap();
+        let interrupt = signal.next().await.unwrap();
 
         assert_eq!(interrupt, libc::SIGINT);
     }
@@ -248,8 +268,23 @@ mod tests {
 
         sys::signal::kill(pid, Some(sys::signal::SIGINT)).unwrap();
 
-        let interrupt = signal.next().await.unwrap().unwrap();
+        let interrupt = signal.next().await.unwrap();
 
         assert_eq!(interrupt, libc::SIGINT);
+    }
+
+    #[async_std::test]
+    async fn multi_signals() {
+        let mut signal1 = Signals::new(vec![libc::SIGINT]).unwrap();
+
+        let mut signal2 = Signals::new(vec![libc::SIGINT]).unwrap();
+
+        let pid = unistd::getpid();
+
+        sys::signal::kill(pid, Some(sys::signal::SIGINT)).unwrap();
+
+        assert_eq!(signal1.next().await.unwrap(), libc::SIGINT);
+
+        assert_eq!(signal2.next().await.unwrap(), libc::SIGINT);
     }
 }
