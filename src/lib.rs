@@ -33,7 +33,7 @@ extern "C" fn handle(receive_signal: c_int) {
         if signal.wants.contains(&receive_signal) {
             signal.queue.push_back(receive_signal);
 
-            if let Some(waker) = signal.waker.take() {
+            while let Some(waker) = signal.wakers.pop_front() {
                 waker.wake();
             }
         }
@@ -43,7 +43,7 @@ extern "C" fn handle(receive_signal: c_int) {
 #[derive(Debug)]
 struct InnerSignals {
     queue: VecDeque<c_int>,
-    waker: Option<Waker>,
+    wakers: VecDeque<Waker>,
     wants: HashSet<c_int>,
 }
 
@@ -51,7 +51,7 @@ impl InnerSignals {
     fn new(wants: HashSet<c_int>) -> Arc<Mutex<Self>> {
         Arc::new(Mutex::new(Self {
             queue: VecDeque::new(),
-            waker: None,
+            wakers: VecDeque::new(),
             wants,
         }))
     }
@@ -196,6 +196,13 @@ impl Signals {
     /// ```
     #[inline]
     pub fn add_signal(&mut self, signal: c_int) -> Result<()> {
+        let mut inner = self.inner.lock().unwrap();
+
+        // signal is registered
+        if inner.wants.get(&signal).is_some() {
+            return Ok(());
+        }
+
         let mut signal_record = SIGNAL_RECORD.lock().unwrap();
 
         let handler = SigHandler::Handler(handle);
@@ -206,8 +213,6 @@ impl Signals {
         unsafe {
             sigaction(Signal::try_from(signal)?, &action)?;
         }
-
-        let mut inner = self.inner.lock().unwrap();
 
         inner.wants.insert(signal);
 
@@ -225,13 +230,17 @@ impl Stream for Signals {
     type Item = c_int;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = if let Ok(inner) = self.inner.try_lock() {
+            inner
+        } else {
+            return Poll::Pending;
+        };
 
         if let Some(signal) = inner.queue.pop_front() {
             return Poll::Ready(Some(signal));
         }
 
-        inner.waker.replace(cx.waker().clone());
+        inner.wakers.push_back(cx.waker().clone());
 
         Poll::Pending
     }
