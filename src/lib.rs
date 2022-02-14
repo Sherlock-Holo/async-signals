@@ -11,18 +11,15 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::task::Context;
 use std::task::{Poll, Waker};
 
-use futures_util::stream::Stream;
+use futures_core::Stream;
 use nix::sys::signal::{sigaction, SaFlags, SigAction, SigHandler, SigSet, Signal};
 use nix::Result;
+use once_cell::sync::Lazy;
 
-use lazy_static::lazy_static;
-
-lazy_static! {
-    static ref ID_GEN: AtomicU64 = AtomicU64::new(0);
-    static ref SIGNAL_SET: RwLock<HashMap<u64, Arc<Mutex<InnerSignals>>>> =
-        RwLock::new(HashMap::new());
-    static ref SIGNAL_RECORD: Mutex<HashMap<c_int, usize>> = Mutex::new(HashMap::new());
-}
+static ID_GEN: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+static SIGNAL_SET: Lazy<RwLock<HashMap<u64, Arc<Mutex<InnerSignals>>>>> =
+    Lazy::new(|| RwLock::new(HashMap::new()));
+static SIGNAL_RECORD: Lazy<Mutex<HashMap<c_int, usize>>> = Lazy::new(|| Mutex::new(HashMap::new()));
 
 extern "C" fn handle(receive_signal: c_int) {
     let signal_map = SIGNAL_SET.read().unwrap();
@@ -120,7 +117,7 @@ impl Signals {
     /// use nix::sys;
     /// use nix::unistd;
     ///
-    /// #[async_std::main]
+    /// #[tokio::main(flavor = "current_thread")]
     /// async fn main() {
     ///     let mut signals = Signals::new(vec![libc::SIGINT]).unwrap();
     ///
@@ -180,7 +177,7 @@ impl Signals {
     /// use nix::sys;
     /// use nix::unistd;
     ///
-    /// #[async_std::main]
+    /// #[tokio::main(flavor = "current_thread")]
     /// async fn main() {
     ///     let mut signals = Signals::new(vec![libc::SIGHUP]).unwrap();
     ///
@@ -254,7 +251,7 @@ mod tests {
 
     use super::*;
 
-    #[async_std::test]
+    #[tokio::test]
     async fn interrupt() {
         let mut signal = Signals::new(vec![libc::SIGINT]).unwrap();
 
@@ -267,7 +264,7 @@ mod tests {
         assert_eq!(interrupt, libc::SIGINT);
     }
 
-    #[async_std::test]
+    #[tokio::test]
     async fn add_signal() {
         let mut signal = Signals::new(vec![libc::SIGHUP]).unwrap();
 
@@ -282,7 +279,7 @@ mod tests {
         assert_eq!(interrupt, libc::SIGINT);
     }
 
-    #[async_std::test]
+    #[tokio::test]
     async fn multi_signals() {
         let mut signal1 = Signals::new(vec![libc::SIGINT]).unwrap();
 
