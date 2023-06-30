@@ -30,7 +30,7 @@ extern "C" fn handle(receive_signal: c_int) {
         if signal.wants.contains(&receive_signal) {
             signal.queue.push_back(receive_signal);
 
-            while let Some(waker) = signal.wakers.pop_front() {
+            if let Some(waker) = signal.waker.take() {
                 waker.wake();
             }
         }
@@ -40,7 +40,7 @@ extern "C" fn handle(receive_signal: c_int) {
 #[derive(Debug)]
 struct InnerSignals {
     queue: VecDeque<c_int>,
-    wakers: VecDeque<Waker>,
+    waker: Option<Waker>,
     wants: HashSet<c_int>,
 }
 
@@ -48,7 +48,7 @@ impl InnerSignals {
     fn new(wants: HashSet<c_int>) -> Arc<Mutex<Self>> {
         Arc::new(Mutex::new(Self {
             queue: VecDeque::new(),
-            wakers: VecDeque::new(),
+            waker: None,
             wants,
         }))
     }
@@ -237,7 +237,7 @@ impl Stream for Signals {
             return Poll::Ready(Some(signal));
         }
 
-        inner.wakers.push_back(cx.waker().clone());
+        inner.waker = Some(cx.waker().clone());
 
         Poll::Pending
     }
