@@ -2,55 +2,49 @@
 //!
 //! You can use this crate with any async runtime.
 
-use std::collections::{HashMap, HashSet, VecDeque};
 use std::convert::TryFrom;
 use std::os::raw::c_int;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::Arc;
 use std::task::Context;
-use std::task::{Poll, Waker};
+use std::task::Poll;
 
-use futures_core::Stream;
+use crossbeam_queue::SegQueue;
+use dashmap::{DashMap, DashSet};
+use futures_util::task::AtomicWaker;
+use futures_util::Stream;
 use nix::sys::signal::{sigaction, SaFlags, SigAction, SigHandler, SigSet, Signal};
 use nix::Result;
 use once_cell::sync::Lazy;
 
-static ID_GEN: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
-static SIGNAL_SET: Lazy<RwLock<HashMap<u64, Arc<Mutex<InnerSignals>>>>> =
-    Lazy::new(|| RwLock::new(HashMap::new()));
-static SIGNAL_RECORD: Lazy<Mutex<HashMap<c_int, usize>>> = Lazy::new(|| Mutex::new(HashMap::new()));
+static ID_GEN: AtomicU64 = AtomicU64::new(0);
+static SIGNAL_SET: Lazy<DashMap<u64, Arc<InnerSignals>>> = Lazy::new(Default::default);
+static SIGNAL_RECORD: Lazy<DashMap<c_int, usize>> = Lazy::new(Default::default);
 
 extern "C" fn handle(receive_signal: c_int) {
-    let signal_map = SIGNAL_SET.read().unwrap();
-
-    for (_, signal) in signal_map.iter() {
-        let mut signal = signal.lock().unwrap();
-
+    for signal in SIGNAL_SET.iter() {
         if signal.wants.contains(&receive_signal) {
-            signal.queue.push_back(receive_signal);
-
-            if let Some(waker) = signal.waker.take() {
-                waker.wake();
-            }
+            signal.queue.push(receive_signal);
+            signal.waker.wake();
         }
     }
 }
 
 #[derive(Debug)]
 struct InnerSignals {
-    queue: VecDeque<c_int>,
-    waker: Option<Waker>,
-    wants: HashSet<c_int>,
+    queue: SegQueue<c_int>,
+    waker: AtomicWaker,
+    wants: DashSet<c_int>,
 }
 
 impl InnerSignals {
-    fn new(wants: HashSet<c_int>) -> Arc<Mutex<Self>> {
-        Arc::new(Mutex::new(Self {
-            queue: VecDeque::new(),
-            waker: None,
+    fn new(wants: DashSet<c_int>) -> Arc<Self> {
+        Arc::new(Self {
+            queue: SegQueue::new(),
+            waker: Default::default(),
             wants,
-        }))
+        })
     }
 }
 
@@ -67,28 +61,32 @@ impl InnerSignals {
 #[derive(Debug)]
 pub struct Signals {
     id: u64,
-    inner: Arc<Mutex<InnerSignals>>,
+    inner: Arc<InnerSignals>,
 }
 
 impl Drop for Signals {
     fn drop(&mut self) {
-        let mut signal_set = SIGNAL_SET.write().unwrap();
+        SIGNAL_SET.remove(&self.id);
 
-        let mut signal_record = SIGNAL_RECORD.lock().unwrap();
-
-        signal_set.remove(&self.id);
-
-        let inner = self.inner.lock().unwrap();
-
-        for drop_signal in inner.wants.iter() {
-            let count = signal_record.get_mut(drop_signal).expect("must exist");
+        for drop_signal in self.inner.wants.iter() {
+            let mut count = SIGNAL_RECORD.get_mut(&*drop_signal).expect("must exist");
 
             if *count > 1 {
                 *count -= 1;
                 continue;
             }
 
-            signal_record.remove(drop_signal);
+            // avoid deadlock
+            drop(count);
+
+            // the count may be increased after we drop the RefMut, so we should make a check when
+            // try to remove it
+            if SIGNAL_RECORD
+                .remove_if(&*drop_signal, |_, count| *count == 0)
+                .is_none()
+            {
+                continue;
+            }
 
             // no one wants to handle this signal, let default handler handle it.
             let default_handler = SigHandler::SigDfl;
@@ -130,18 +128,10 @@ impl Signals {
     /// }
     /// ```
     pub fn new<I: IntoIterator<Item = c_int>>(signals: I) -> Result<Signals> {
-        let id = ID_GEN.fetch_add(1, Ordering::Relaxed);
-
-        let mut signal_set = SIGNAL_SET.write().unwrap();
-
-        let mut signal_record = SIGNAL_RECORD.lock().unwrap();
-
         let handler = SigHandler::Handler(handle);
-
         let action = SigAction::new(handler, SaFlags::SA_RESTART, SigSet::empty());
 
-        let mut wants = HashSet::new();
-
+        let wants = DashSet::new();
         for signal in signals {
             // register handle
             unsafe {
@@ -151,7 +141,7 @@ impl Signals {
             wants.insert(signal);
 
             // increase signal record count
-            signal_record
+            SIGNAL_RECORD
                 .entry(signal)
                 .and_modify(|count| *count += 1)
                 .or_insert(1);
@@ -159,7 +149,8 @@ impl Signals {
 
         let inner_signals = InnerSignals::new(wants);
 
-        signal_set.insert(id, inner_signals.clone());
+        let id = ID_GEN.fetch_add(1, Ordering::Relaxed);
+        SIGNAL_SET.insert(id, inner_signals.clone());
 
         Ok(Self {
             id,
@@ -193,17 +184,12 @@ impl Signals {
     /// ```
     #[inline]
     pub fn add_signal(&mut self, signal: c_int) -> Result<()> {
-        let mut inner = self.inner.lock().unwrap();
-
         // signal is registered
-        if inner.wants.get(&signal).is_some() {
+        if self.inner.wants.get(&signal).is_some() {
             return Ok(());
         }
 
-        let mut signal_record = SIGNAL_RECORD.lock().unwrap();
-
         let handler = SigHandler::Handler(handle);
-
         let action = SigAction::new(handler, SaFlags::SA_RESTART, SigSet::empty());
 
         // register handle
@@ -211,10 +197,10 @@ impl Signals {
             sigaction(Signal::try_from(signal)?, &action)?;
         }
 
-        inner.wants.insert(signal);
+        self.inner.wants.insert(signal);
 
         // increase signal record count
-        signal_record
+        SIGNAL_RECORD
             .entry(signal)
             .and_modify(|count| *count += 1)
             .or_insert(1);
@@ -227,17 +213,12 @@ impl Stream for Signals {
     type Item = c_int;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        let mut inner = if let Ok(inner) = self.inner.try_lock() {
-            inner
-        } else {
-            return Poll::Pending;
-        };
+        // register at first, make sure when ready, we can be notified
+        self.inner.waker.register(cx.waker());
 
-        if let Some(signal) = inner.queue.pop_front() {
+        if let Some(signal) = self.inner.queue.pop() {
             return Poll::Ready(Some(signal));
         }
-
-        inner.waker = Some(cx.waker().clone());
 
         Poll::Pending
     }
@@ -282,7 +263,6 @@ mod tests {
     #[tokio::test]
     async fn multi_signals() {
         let mut signal1 = Signals::new(vec![libc::SIGINT]).unwrap();
-
         let mut signal2 = Signals::new(vec![libc::SIGINT]).unwrap();
 
         let pid = unistd::getpid();
