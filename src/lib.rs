@@ -4,60 +4,165 @@
 
 use std::collections::HashMap;
 use std::convert::TryFrom;
+use std::io::{Read, Write};
 use std::os::raw::c_int;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Arc, Mutex, Once};
 use std::task::Context;
 use std::task::Poll;
+use std::{io, thread};
 
 use crossbeam_queue::SegQueue;
-use crossbeam_skiplist::{SkipMap, SkipSet};
+use crossbeam_skiplist::SkipSet;
 use futures_util::task::AtomicWaker;
 use futures_util::Stream;
 use nix::sys::signal::{sigaction, SaFlags, SigAction, SigHandler, SigSet, Signal};
-use nix::Result;
 use once_cell::sync::Lazy;
+use os_pipe::{PipeReader, PipeWriter};
 
-static ID_GEN: AtomicU64 = AtomicU64::new(0);
-static SIGNAL_SET: Lazy<SkipMap<u64, Arc<InnerSignals>>> = Lazy::new(Default::default);
+static PIPE: Lazy<io::Result<(PipeReader, PipeWriter)>> = Lazy::new(os_pipe::pipe);
+static SIGNALS_SET: Lazy<SignalsSet> = Lazy::new(SignalsSet::default);
 
-// why SIGNAL_SET use SkipMap but SIGNAL_RECORD use the Mutex<HashMap>?
-//
-// SIGNAL_SET is used to register the InnerSignals and notify the InnerSignals when signal is
-// accepted, the signal handle function require **make syscall that are explicitly marked safe for
-// signal handlers and only share global data using atomics**, so the SIGNAL_SET need a lock-free
-// container
-//
-// however SIGNAL_RECORD just used to count the signal watcher, when a new signal is watched, the
-// signal handle function need to be installed, and when no one watch a signal, the signal handle
-// function need to be removed, we need a mutex to protect this operation
-static SIGNAL_RECORD: Lazy<Mutex<HashMap<c_int, usize>>> = Lazy::new(Default::default);
+#[derive(Debug)]
+struct SignalsSet {
+    id_gen: AtomicU32,
+    signal_notifiers: Mutex<SignalNotifiers>,
+    start_signal_handle_thread: Once,
+}
 
-extern "C" fn handle(receive_signal: c_int) {
-    for signal in SIGNAL_SET.iter() {
-        let signal = signal.value();
-        if signal.wants.contains(&receive_signal) {
-            signal.queue.push(receive_signal);
-            signal.waker.wake();
+impl Default for SignalsSet {
+    fn default() -> Self {
+        Self {
+            id_gen: Default::default(),
+            signal_notifiers: Mutex::new(Default::default()),
+            start_signal_handle_thread: Once::new(),
         }
     }
 }
 
-#[derive(Debug)]
-struct InnerSignals {
-    queue: SegQueue<c_int>,
-    waker: AtomicWaker,
-    wants: SkipSet<c_int>,
+impl SignalsSet {
+    fn generate_id(&self) -> u32 {
+        self.id_gen.fetch_add(1, Ordering::Relaxed)
+    }
+
+    fn start_signal_handle_thread(&'static self) {
+        self.start_signal_handle_thread.call_once(|| {
+            thread::spawn(|| {
+                let mut reader = get_pipe_reader();
+                loop {
+                    let mut buf = [0];
+                    (&mut reader).read_exact(&mut buf).unwrap_or_else(|err| {
+                        panic!("pipe reader read return error {err}, that should not happened")
+                    });
+
+                    let signal_notifiers = self.signal_notifiers.lock().unwrap();
+                    for signal_inner in signal_notifiers.notifiers.values() {
+                        if signal_inner.interest(buf[0] as _) {
+                            signal_inner.notify(buf[0] as _);
+                        }
+                    }
+                }
+            });
+        })
+    }
 }
 
-impl InnerSignals {
-    fn new(wants: SkipSet<c_int>) -> Arc<Self> {
-        Arc::new(Self {
-            queue: SegQueue::new(),
+#[derive(Debug, Default)]
+struct SignalNotifiers {
+    installed_signals: HashMap<c_int, usize>,
+    notifiers: HashMap<u32, Arc<SignalsInner>>,
+}
+
+impl SignalNotifiers {
+    fn add_signal(&mut self, signal: c_int) -> io::Result<()> {
+        let count = self
+            .installed_signals
+            .entry(signal)
+            .and_modify(|count| *count += 1)
+            .or_insert(1);
+        if *count == 1 {
+            let handler = SigHandler::Handler(handle);
+            let action = SigAction::new(handler, SaFlags::SA_RESTART, SigSet::empty());
+
+            unsafe {
+                sigaction(Signal::try_from(signal)?, &action)?;
+            }
+        }
+
+        Ok(())
+    }
+
+    fn remove_signal(&mut self, signal: c_int) -> io::Result<()> {
+        if let Some(count) = self.installed_signals.get_mut(&signal) {
+            *count -= 1;
+            if *count == 0 {
+                let action =
+                    SigAction::new(SigHandler::SigDfl, SaFlags::SA_RESTART, SigSet::empty());
+
+                unsafe {
+                    let signal = Signal::try_from(signal)
+                        .unwrap_or_else(|_| panic!("signal {signal} should be valid"));
+                    let _ = sigaction(signal, &action);
+                }
+
+                self.installed_signals.remove(&signal);
+            }
+        }
+
+        Ok(())
+    }
+
+    fn add_notifier(&mut self, id: u32, signals_inner: Arc<SignalsInner>) {
+        self.notifiers.insert(id, signals_inner);
+    }
+
+    fn remove_notifier(&mut self, id: u32) {
+        self.notifiers.remove(&id);
+    }
+}
+
+fn get_pipe_writer() -> &'static PipeWriter {
+    match PIPE.as_ref() {
+        Err(_) => unreachable!("if init pipe failed, should not get pipe writer"),
+        Ok((_, writer)) => writer,
+    }
+}
+
+fn get_pipe_reader() -> &'static PipeReader {
+    match PIPE.as_ref() {
+        Err(_) => unreachable!("if init pipe failed, should not get pipe writer"),
+        Ok((reader, _)) => reader,
+    }
+}
+
+extern "C" fn handle(receive_signal: c_int) {
+    let _ = get_pipe_writer().write(&[receive_signal as _]);
+}
+
+#[derive(Debug)]
+struct SignalsInner {
+    queue: SegQueue<c_int>,
+    waker: AtomicWaker,
+    interests: SkipSet<c_int>,
+}
+
+impl SignalsInner {
+    fn new(interests: SkipSet<c_int>) -> Self {
+        Self {
+            queue: Default::default(),
             waker: Default::default(),
-            wants,
-        })
+            interests,
+        }
+    }
+
+    fn interest(&self, signal: c_int) -> bool {
+        self.interests.contains(&signal)
+    }
+
+    fn notify(&self, signal: c_int) {
+        self.queue.push(signal);
+        self.waker.wake();
     }
 }
 
@@ -73,35 +178,17 @@ impl InnerSignals {
 /// You can't handle `SIGKILL` or `SIGSTOP`.
 #[derive(Debug)]
 pub struct Signals {
-    id: u64,
-    inner: Arc<InnerSignals>,
+    id: u32,
+    inner: Arc<SignalsInner>,
 }
 
 impl Drop for Signals {
     fn drop(&mut self) {
-        SIGNAL_SET.remove(&self.id);
+        let mut signal_notifiers = SIGNALS_SET.signal_notifiers.lock().unwrap();
+        signal_notifiers.remove_notifier(self.id);
 
-        let mut signal_record = SIGNAL_RECORD.lock().unwrap();
-        for drop_signal in self.inner.wants.iter() {
-            let count = signal_record.get_mut(&*drop_signal).expect("must exist");
-            *count -= 1;
-
-            if *count > 0 {
-                continue;
-            }
-
-            // no one wants to handle this signal, let default handler handle it.
-            let default_handler = SigHandler::SigDfl;
-            let default_action =
-                SigAction::new(default_handler, SaFlags::SA_RESTART, SigSet::empty());
-
-            unsafe {
-                // TODO should I ignore error?
-                let _ = sigaction(
-                    Signal::try_from(*drop_signal).expect("checked"),
-                    &default_action,
-                );
-            }
+        for signal in &self.inner.interests {
+            let _ = signal_notifiers.remove_signal(*signal.value());
         }
     }
 }
@@ -129,27 +216,28 @@ impl Signals {
     ///     assert_eq!(signal, libc::SIGINT);
     /// }
     /// ```
-    pub fn new<I: IntoIterator<Item = c_int>>(signals: I) -> Result<Signals> {
-        let handler = SigHandler::Handler(handle);
-        let action = SigAction::new(handler, SaFlags::SA_RESTART, SigSet::empty());
+    pub fn new<I: IntoIterator<Item = c_int>>(signals: I) -> io::Result<Signals> {
+        Self::check_pipe()?;
 
-        let mut signal_record = SIGNAL_RECORD.lock().unwrap();
-        let wants = SkipSet::new();
-        for signal in signals {
-            wants.insert(signal);
+        SIGNALS_SET.start_signal_handle_thread();
 
-            Self::record_and_install_signal_handle(&mut signal_record, signal, action)?;
+        let signals = signals.into_iter().collect::<SkipSet<_>>();
+        let id = SIGNALS_SET.generate_id();
+        let mut signal_notifiers = SIGNALS_SET.signal_notifiers.lock().unwrap();
+        for signal in &signals {
+            signal_notifiers.add_signal(*signal.value())?;
         }
 
-        let inner_signals = InnerSignals::new(wants);
+        let inner = Arc::new(SignalsInner::new(signals));
+        signal_notifiers.add_notifier(id, inner.clone());
 
-        let id = ID_GEN.fetch_add(1, Ordering::Relaxed);
-        SIGNAL_SET.insert(id, inner_signals.clone());
+        Ok(Self { id, inner })
+    }
 
-        Ok(Self {
-            id,
-            inner: inner_signals,
-        })
+    fn check_pipe() -> io::Result<()> {
+        PIPE.as_ref()
+            .map(|_| ())
+            .map_err(|err| io::Error::new(err.kind(), err.to_string()))
     }
 
     /// Registers another signal to a created `Signals`.
@@ -176,43 +264,13 @@ impl Signals {
     ///     assert_eq!(signal, libc::SIGINT);
     /// }
     /// ```
-    #[inline]
-    pub fn add_signal(&mut self, signal: c_int) -> Result<()> {
-        // signal is registered
-        if self.inner.wants.get(&signal).is_some() {
-            return Ok(());
-        }
-
-        let handler = SigHandler::Handler(handle);
-        let action = SigAction::new(handler, SaFlags::SA_RESTART, SigSet::empty());
-        let mut signal_record = SIGNAL_RECORD.lock().unwrap();
-
-        Self::record_and_install_signal_handle(&mut signal_record, signal, action)?;
-
-        drop(signal_record);
-
-        self.inner.wants.insert(signal);
-
-        Ok(())
-    }
-
-    fn record_and_install_signal_handle(
-        signal_record: &mut HashMap<c_int, usize>,
-        signal: c_int,
-        action: SigAction,
-    ) -> Result<()> {
-        // increase signal record count
-        if *signal_record
-            .entry(signal)
-            .and_modify(|count| *count += 1)
-            .or_insert(1)
-            == 1
-        {
-            // register handle when record is 1, that means no previous Signals watch this signal
-            unsafe {
-                sigaction(Signal::try_from(signal)?, &action)?;
-            }
-        }
+    pub fn add_signal(&mut self, signal: c_int) -> io::Result<()> {
+        SIGNALS_SET
+            .signal_notifiers
+            .lock()
+            .unwrap()
+            .add_signal(signal)?;
+        self.inner.interests.insert(signal);
 
         Ok(())
     }
