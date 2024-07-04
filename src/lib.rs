@@ -6,6 +6,7 @@ use std::collections::HashMap;
 use std::convert::TryFrom;
 use std::io::{Read, Write};
 use std::os::raw::c_int;
+use std::os::unix::net::UnixStream;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, Once};
@@ -19,9 +20,8 @@ use futures_util::task::AtomicWaker;
 use futures_util::Stream;
 use nix::sys::signal::{sigaction, SaFlags, SigAction, SigHandler, SigSet, Signal};
 use once_cell::sync::Lazy;
-use os_pipe::{PipeReader, PipeWriter};
 
-static PIPE: Lazy<io::Result<(PipeReader, PipeWriter)>> = Lazy::new(os_pipe::pipe);
+static PIPE: Lazy<io::Result<(UnixStream, UnixStream)>> = Lazy::new(UnixStream::pair);
 static SIGNALS_SET: Lazy<SignalsSet> = Lazy::new(SignalsSet::default);
 
 #[derive(Debug)]
@@ -122,14 +122,14 @@ impl SignalNotifiers {
     }
 }
 
-fn get_pipe_writer() -> &'static PipeWriter {
+fn get_pipe_writer() -> &'static UnixStream {
     match PIPE.as_ref() {
         Err(_) => unreachable!("if init pipe failed, should not get pipe writer"),
         Ok((_, writer)) => writer,
     }
 }
 
-fn get_pipe_reader() -> &'static PipeReader {
+fn get_pipe_reader() -> &'static UnixStream {
     match PIPE.as_ref() {
         Err(_) => unreachable!("if init pipe failed, should not get pipe writer"),
         Ok((reader, _)) => reader,
