@@ -21,7 +21,14 @@ use futures_util::Stream;
 use nix::sys::signal::{sigaction, SaFlags, SigAction, SigHandler, SigSet, Signal};
 use once_cell::sync::Lazy;
 
-static PIPE: Lazy<io::Result<(UnixStream, UnixStream)>> = Lazy::new(UnixStream::pair);
+static PIPE: Lazy<io::Result<(UnixStream, UnixStream)>> = Lazy::new(|| {
+    let (reader, write) = UnixStream::pair()?;
+    // don't block the signal handler
+    write.set_nonblocking(true)?;
+
+    Ok((reader, write))
+});
+
 static SIGNALS_SET: Lazy<SignalsSet> = Lazy::new(SignalsSet::default);
 
 #[derive(Debug)]
